@@ -1,0 +1,14 @@
+Control estimation skipped. Set run_control=true to use the CSV.
+Illustrative interior FOC solutions:
+Beta_0 | Effort T1 | Effort T2 | Win Prob T1
+0.0200	0.5030	0.5030	0.5000
+0.0250	0.4993	0.4993	0.5000
+0.0270	0.4979	0.4979	0.5000
+0.0300	0.4958	0.4958	0.5000
+0.0320	0.4944	0.4944	0.5000
+0.0420	0.4879	0.4879	0.5000
+0.0520	0.4818	0.4818	0.5000
+0.0620	0.4761	0.4761	0.5000
+0.0030	0.5170	0.5170	0.5000
+Response-curve roots accepted: teacher 1 101/101; teacher 2 101/101.
+Model outputs saved in E:\One Drive\OneDrive - connect.hku.hk\Desktop\test\output\model
