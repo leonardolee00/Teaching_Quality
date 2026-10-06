@@ -1,4 +1,4 @@
-# Teacher Incentives and Teaching Quality: Coding Sample
+# Teacher Incentives and Teaching Quality
 
 This project comes from my work as a research assistant for Professor Juan Pantano at the
 University of Hong Kong. 
