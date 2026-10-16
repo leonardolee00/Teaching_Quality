@@ -1,0 +1,8 @@
+check,diagnostic,result
+Additive tau = 0 reproduces the baseline,0.000,Yes
+Multiplicative tau = 0 reproduces the baseline,0.000,Yes
+Migration-cost lambda = 1 reproduces the baseline,0.000,Yes
+High kappa reduces migration,0.000,Yes
+Low kappa and high A_N/A_A increase migration,0.491,Yes
+rho = 1 gives additive farm labor,0.000,Yes
+Lower rho makes losing a healthy member more costly,0.119,Yes

@@ -1,0 +1,1450 @@
+---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+      name:  pipeline
+       log:  E:\predoc2027\ec428-exhibition\stata/output/logs/run_all.log
+  log type:  text
+ opened on:  17 Oct 2026, 00:24:44
+
+. display as text "Stata version: " c(stata_version) "; started " c(current_date) " " c(current_time)
+Stata version: 17; started 17 Oct 2026 00:24:44
+
+. display as text "Simulation: `run_simulation'; quick test: `quick_test'; new households: `new_households'."
+Simulation: 1; quick test: 0; new households: 0.
+
+. local start = clock("`c(current_date)' `c(current_time)'", "DMYhms")
+
+. 
+. local stages model/Check_model.do
+
+. if `run_simulation' {
+.     local stages `stages' simulation/Run_simulations.do
+. }
+
+. else {
+.     display as text "Simulation skipped. Tables and figures use the existing data/derived files."
+. }
+
+. local stages `stages' analysis/Make_tables.do analysis/Make_figures.do
+
+. 
+. foreach stage of local stages {
+  2.     display as result _n "Running `stage'..."
+  3.     capture noisily do "`project_root'/`stage'" "`project_root'" ///
+>         `quick_test' `new_households' `seed'
+  4.     local stage_rc = _rc
+  5.     if `stage_rc' {
+  6.         display as error "Stopped in `stage' (return code `stage_rc'). See output/logs/run_all.log."
+  7.         log close pipeline
+  8.         exit `stage_rc'
+  9.     }
+ 10. }
+
+Running model/Check_model.do...
+
+. /*
+> Model checks
+> 
+> Purpose: Check that the solver in Household_model.do computes the model
+> correctly, before any simulation is run.
+> 1. Benchmark: 100 runs on 40 test households, covering every shock family, must
+>    reproduce the results of the R version of this project.
+> 2. Exhaustive check: in each of those runs, every household must choose the same
+>    allocation as a slow solver that values one allocation at a time.
+> 3. Ties: a member who is exactly indifferent stays on the farm.
+> 
+> Input: data/benchmark/benchmark_households.csv (simulated test households) and
+> data/benchmark/benchmark_results.csv (run settings and the R results).
+> Requirements: Stata 17 or later.
+> 
+> Outputs: None. The results are printed to the log; any failure stops the run.
+> Run from the project root via run_all.do or do model/Check_model.do.
+> An optional first argument supplies the project root.
+> */
+. 
+. version 17
+
+. clear all
+
+. set more off
+
+. 
+. args project_root
+
+. if `"`project_root'"' == "" local project_root "`c(pwd)'"
+
+. 
+. capture confirm file "`project_root'/run_all.do"
+
+. if _rc {
+.     display as error "Run from the project root: cd to the folder containing run_all.do."
+.     exit 601
+. }
+
+. local benchmark "`project_root'/data/benchmark"
+
+. run "`project_root'/model/Household_model.do"
+
+. 
+. mata:
+------------------------------------------------- mata (type end to exit) -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+: // Slow solver for one household: value each allocation separately and keep the
+: // first one unless a later one is better by more than 1e-10.
+: real rowvector ec_slow_choice(real rowvector h, real scalar land,
+>     real rowvector par, real rowvector shock)
+> {
+>     real matrix M, h_farm, h_market
+>     real rowvector best_m
+>     real scalar k, farm, market, cost, value, best, lambda
+> 
+>     h_farm = ec_farm_health(h, shock)
+>     h_market = ec_market_health(h, shock)
+>     lambda = ec_cost_factor(shock)
+>     M = ec_allocations(cols(h))
+>     best = .
+>     best_m = J(1, cols(h), .)
+>     for (k = 1; k <= rows(M); k++) {
+>         farm = ec_farm_output(select(h_farm, M[k, .] :== 0), land, par)
+>         market = par[2] * sum(M[k, .] :* h_market :^ par[3])
+>         cost = lambda * par[6] * sum(M[k, .] :* h_market :^ (-par[7]))
+>         value = farm + market - cost
+>         if (k == 1 | value > best + 1e-10) {
+>             best = value
+>             best_m = M[k, .]
+>         }
+>     }
+>     return(best_m)
+> }
+
+: 
+: // Compare the batched solver with the slow solver for every run in memory and
+: // every stored household.
+: void ec_check_exhaustive()
+> {
+>     external real matrix ec_H
+>     external real colvector ec_size, ec_land
+>     real matrix par, shock, choice
+>     real scalar r, j, n, checked
+> 
+>     par = st_data(., "A_A A_N beta gamma rho kappa eta")
+>     shock = st_data(., "shock_type tau lambda tau_a tau_m")
+>     choice = J(0, 0, .)
+>     checked = 0
+>     for (r = 1; r <= rows(par); r++) {
+>         (void) ec_solve(ec_H, ec_size, ec_land, par[r, .], shock[r, .], choice)
+>         for (j = 1; j <= rows(ec_H); j++) {
+>             n = ec_size[j]
+>             if (ec_slow_choice(ec_H[j, 1..n], ec_land[j], par[r, .], shock[r, .]) != choice[j, 1..n]) {
+>                 _error(3498, sprintf("run %g, household %g: the two solvers disagree", r, j))
+>             }
+>             checked++
+>         }
+>     }
+>     printf("{res}Exhaustive check: all %g household choices match the slow solver.\n", checked)
+> }
+
+: 
+: // With health 1, land 1, A_A = 1, A_N = 2 and kappa = 1, staying and migrating
+: // both give income 1. The member should stay.
+: void ec_check_tie()
+> {
+>     real matrix choice
+> 
+>     choice = J(0, 0, .)
+>     (void) ec_solve((1, ., ., ., ., .), 1, 1, (1, 2, 1, .55, .80, 1, 1.25),
+>         (0, 0, 1, 0, 0), choice)
+>     if (choice[1, 1] != 0) _error(3498, "an indifferent member should stay on the farm")
+>     printf("{res}Tie check: an indifferent member stays on the farm.\n")
+> }
+
+: end
+---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+
+. 
+. * 1. Benchmark: solve the 100 runs and compare every outcome with the R results.
+. import delimited using "`benchmark'/benchmark_households.csv", clear varnames(1) asdouble
+(encoding automatically selected: ISO-8859-1)
+(4 vars, 179 obs)
+
+. ec_load_households
+
+. 
+. import delimited using "`benchmark'/benchmark_results.csv", clear varnames(1) asdouble
+(encoding automatically selected: ISO-8859-1)
+(30 vars, 100 obs)
+
+. assert _N == 100
+
+. rename (aa an) (A_A A_N)
+
+. local outcomes households workers ag_workers nonag_workers ag_output nonag_output ///
+>     migration_costs welfare migration_rate lp_a lp_n apg initial_health_migrants ///
+>     initial_health_stayers current_health_migrants current_health_stayers
+
+. foreach v of local outcomes {
+  2.     rename `v' r_`v'
+  3. }
+
+. mata: ec_solve_runs()
+
+. ec_measures
+
+. foreach v of local outcomes {
+  2.     assert missing(`v') == missing(r_`v')
+  3.     assert reldif(`v', r_`v') < 1e-9 if !missing(r_`v')
+  4. }
+
+. display as result "Benchmark: all 100 runs match the R results (relative difference below 1e-9)."
+Benchmark: all 100 runs match the R results (relative difference below 1e-9).
+
+. 
+. * 2. Exhaustive check on the same 100 runs and 40 households.
+. mata: ec_check_exhaustive()
+Exhaustive check: all 4000 household choices match the slow solver.
+
+. 
+. * 3. Ties.
+. mata: ec_check_tie()
+Tie check: an indifferent member stays on the farm.
+
+. 
+. display as result "Done: all model checks passed."
+Done: all model checks passed.
+
+. 
+end of do-file
+
+Running simulation/Run_simulations.do...
+
+. /*
+> Simulations
+> 
+> Purpose: Run the simulation experiments of the EC428 essay (Section 4) with the
+> exact household solver.
+> 1. Households: the saved simulated households, or new draws made in Stata.
+> 2. Theory checks: seven properties of the model (essay Table 1).
+> 3. Baseline: additive health shocks tau = 0, .05, ..., .40 at the baseline
+>    calibration (essay Tables 3 and 5; Figures 1, 2, 3 and 5).
+> 4. Parameter regions: every admissible parameter vector of essay Table 8 with
+>    each of the 24 shocks (essay Tables 2, 4 and 7; Figures 4, 6, 7, 9 and 10).
+> 5. Robustness: kappa, eta or rho varied one at a time (essay Table 6).
+> 
+> Input: data/simulated/baseline_households.csv and grid_households.csv
+> (not used when new households are drawn).
+> Requirements: Stata 17 or later.
+> 
+> Outputs, all in data/derived/:
+> - households_baseline.dta, households_grid.dta: the households used
+> - validation_checks.dta: theory checks
+> - baseline_results.dta, baseline_choices.dta: baseline experiment
+> - parameter_regions.dta: every parameter-shock run
+> - robustness.dta: robustness runs
+> - run_settings.dta: the settings of this run
+> 
+> Run from the project root via run_all.do or do simulation/Run_simulations.do.
+> Optional arguments: project root, quick test (0/1), new households (0/1), seed.
+> */
+. 
+. version 17
+
+. clear all
+
+. set more off
+
+. 
+. args project_root quick_test new_households seed
+
+. if `"`project_root'"' == "" local project_root "`c(pwd)'"
+
+. if "`quick_test'" == "" local quick_test = 0
+
+. if "`new_households'" == "" local new_households = 0
+
+. if "`seed'" == "" local seed = 123
+
+. 
+. capture confirm file "`project_root'/run_all.do"
+
+. if _rc {
+.     display as error "Run from the project root: cd to the folder containing run_all.do."
+.     exit 601
+. }
+
+. local data "`project_root'/data/derived"
+
+. capture mkdir "`project_root'/data"
+
+. capture mkdir "`data'"
+
+. run "`project_root'/model/Household_model.do"
+
+. 
+. * Baseline calibration (essay Section 4), in the order A_A A_N beta gamma rho kappa eta.
+. local calibration 1 1.80 1 .55 .80 .25 1.25
+
+. 
+. capture program drop add_calibration
+
+. program define add_calibration
+  1.     * Add the baseline calibration to every observation as variables A_A-eta.
+.     args A_A A_N beta gamma rho kappa eta
+  2.     foreach p in A_A A_N beta gamma rho kappa eta {
+  3.         generate double `p' = ``p''
+  4.     }
+  5. end
+
+. 
+. capture program drop compare_with_no_shock
+
+. program define compare_with_no_shock
+  1.     * Compare each run with the no-shock run (shock_id 0) of the same parameter
+.     * vector, and classify it as in essay Section 4 and Table 2.
+.     sort parameter_id shock_id
+  2.     by parameter_id: assert shock_id[1] == 0 & shock_type[1] == 0
+  3.     foreach v in migration_rate ag_output nonag_output welfare lp_a lp_n apg {
+  4.         by parameter_id: generate double d_`v' = `v' - `v'[1]
+  5.     }
+  6.     * APG changes count only if both sectors are active before and after the shock.
+.     by parameter_id: generate byte apg_valid = ag_workers > 0 & nonag_workers > 0 & ///
+>         ag_workers[1] > 0 & nonag_workers[1] > 0 & !missing(d_apg)
+  7.     generate byte apg_direction = cond(d_apg > .01, 1, cond(d_apg < -.01, 3, 2)) if apg_valid
+  8.     * Core mechanism: migration and welfare rise, and migrants are healthier than
+.     * farm stayers (health before the shock). When no one is left on the farm the
+.     * health comparison is undefined; as in the essay's tables, the run counts.
+.     generate byte selected = initial_health_migrants > initial_health_stayers + 1e-10 ///
+>         if nonag_workers > 0 & ag_workers > 0
+  9.     generate byte core_mechanism = d_migration_rate > 1e-10 & d_welfare > 1e-10 & ///
+>         (selected == 1 | ag_workers == 0)
+ 10.     generate byte ag_output_decline = d_ag_output < -1e-10
+ 11.     drop selected
+ 12.     label define direction 1 "Widening" 2 "About unchanged" 3 "Narrowing", replace
+ 13.     label values apg_direction direction
+ 14.     label variable apg_valid "Both sectors active before and after the shock"
+ 15.     label variable apg_direction "Change in APG: above .01, within .01, below -.01"
+ 16.     label variable core_mechanism "Migration and welfare rise; migrants positively selected"
+ 17.     label variable ag_output_decline "Farm output falls"
+ 18. end
+
+. 
+. capture program drop label_runs
+
+. program define label_runs
+  1.     label variable parameter_id "Parameter vector"
+  2.     label variable shock_id "Shock"
+  3.     label variable shock_type "Shock family"
+  4.     label variable tau "Health shock, tau"
+  5.     label variable lambda "Migration-cost multiplier, lambda"
+  6.     label variable tau_a "Farm health shock, tau_A"
+  7.     label variable tau_m "Market health shock, tau_M"
+  8.     label define shock_family 0 "No shock" 1 "Additive health" 2 "Multiplicative health" ///
+>         3 "Migration cost" 4 "Two health indices", replace
+  9.     label values shock_type shock_family
+ 10. end
+
+. 
+. 
+. * 1. Households: one row per person (hh_id member_id health land).
+. foreach sample in baseline grid {
+  2.     if `new_households' {
+  3.         * Draws as in essay Section 3.1: size uniform on 3-6; land log-normal with
+.         * log mean 0 and log SD .30; health = .10 + .90 * logistic(xi + e), where
+.         * xi ~ N(0, .60^2) is shared within the household and e ~ N(0, .70^2).
+.         local households = cond("`sample'" == "baseline", 10000, 1000)
+  4.         clear
+  5.         set seed `seed'
+  6.         quietly set obs `households'
+  7.         generate long hh_id = _n
+  8.         generate byte hh_size = 3 + floor(4 * runiform())
+  9.         generate double land = exp(.30 * rnormal())
+ 10.         generate double xi = .60 * rnormal()
+ 11.         quietly expand hh_size
+ 12.         bysort hh_id: generate byte member_id = _n
+ 13.         generate double health = .10 + .90 * invlogit(xi + .70 * rnormal())
+ 14.         keep hh_id member_id health land
+ 15.     }
+ 16.     else {
+ 17.         import delimited using "`project_root'/data/simulated/`sample'_households.csv", ///
+>             clear varnames(1) asdouble
+ 18.     }
+ 19.     if `quick_test' {
+ 20.         quietly keep if hh_id <= cond("`sample'" == "baseline", 500, 250)
+ 21.     }
+ 22. 
+.     sort hh_id member_id
+ 23.     isid hh_id member_id
+ 24.     assert !missing(health, land)
+ 25.     assert health > 0 & health <= 1 & land > 0
+ 26.     by hh_id: assert member_id == _n
+ 27.     by hh_id: assert land == land[1]
+ 28.     by hh_id: assert _N <= 6
+ 29.     label variable hh_id "Household"
+ 30.     label variable member_id "Member"
+ 31.     label variable health "Health before any shock"
+ 32.     label variable land "Household land"
+ 33.     quietly count if member_id == 1
+ 34.     display as text "`sample' households: " r(N) " households, " _N " members."
+ 35.     save "`data'/households_`sample'.dta", replace
+ 36. }
+(encoding automatically selected: ISO-8859-1)
+(4 vars, 45,065 obs)
+baseline households: 10000 households, 45065 members.
+file E:\predoc2027\ec428-exhibition\stata/data/derived/households_baseline.dta saved
+(encoding automatically selected: ISO-8859-1)
+(4 vars, 4,500 obs)
+grid households: 1000 households, 4500 members.
+file E:\predoc2027\ec428-exhibition\stata/data/derived/households_grid.dta saved
+
+. 
+. 
+. * 2. Theory checks (essay Table 1), on the grid households.
+. use "`data'/households_grid.dta", clear
+
+. ec_load_households
+
+. clear
+
+. quietly set obs 7
+
+. mata: st_store(., st_addvar("double", ("diagnostic", "passed")), ec_theory_checks("`calibration'"))
+
+. generate byte check_id = _n
+
+. label define check ///
+>     1 "Additive tau = 0 reproduces the baseline" ///
+>     2 "Multiplicative tau = 0 reproduces the baseline" ///
+>     3 "Migration-cost lambda = 1 reproduces the baseline" ///
+>     4 "High kappa reduces migration" ///
+>     5 "Low kappa and high A_N/A_A increase migration" ///
+>     6 "rho = 1 gives additive farm labor" ///
+>     7 "Lower rho makes losing a healthy member more costly", replace
+
+. label values check_id check
+
+. order check_id
+
+. list, noobs clean
+
+                                               check_id   diagnos~c   passed  
+               Additive tau = 0 reproduces the baseline           0        1  
+         Multiplicative tau = 0 reproduces the baseline           0        1  
+      Migration-cost lambda = 1 reproduces the baseline           0        1  
+                           High kappa reduces migration           0        1  
+          Low kappa and high A_N/A_A increase migration   .49088889        1  
+                      rho = 1 gives additive farm labor           0        1  
+    Lower rho makes losing a healthy member more costly   .11874889        1  
+
+. assert passed == 1
+
+. save "`data'/validation_checks.dta", replace
+file E:\predoc2027\ec428-exhibition\stata/data/derived/validation_checks.dta saved
+
+. 
+. 
+. * 3. Baseline experiment: additive health shocks at the baseline calibration.
+. use "`data'/households_baseline.dta", clear
+
+. ec_load_households
+
+. 
+. * Each member's choice with no shock and with tau = .40 (essay Figure 1).
+. mata: ec_store_choices("`calibration'", "0 0 1 0 0", "before")
+
+. mata: ec_store_choices("`calibration'", "1 .40 1 0 0", "after")
+
+. quietly reshape long health before after, i(hh_id) j(member_id)
+
+. quietly drop if missing(health)
+
+. rename (before after) (migrate_before migrate_after)
+
+. keep hh_id member_id health land migrate_before migrate_after
+
+. label variable member_id "Member"
+
+. label variable health "Health before the shock"
+
+. label variable migrate_before "Migrates, no shock"
+
+. label variable migrate_after "Migrates, additive shock tau = .40"
+
+. save "`data'/baseline_choices.dta", replace
+file E:\predoc2027\ec428-exhibition\stata/data/derived/baseline_choices.dta saved
+
+. 
+. * Runs: shock 0 is no shock; shocks 1-8 are tau = .05, .10, ..., .40.
+. clear
+
+. quietly set obs 9
+
+. generate long parameter_id = 1
+
+. generate byte shock_id = _n - 1
+
+. generate byte shock_type = cond(shock_id == 0, 0, 1)
+
+. generate double tau = shock_id / 20
+
+. generate double lambda = 1
+
+. generate double tau_a = 0
+
+. generate double tau_m = 0
+
+. add_calibration `calibration'
+
+. mata: ec_solve_runs()
+
+. ec_measures
+
+. compare_with_no_shock
+
+. label_runs
+
+. save "`data'/baseline_results.dta", replace
+file E:\predoc2027\ec428-exhibition\stata/data/derived/baseline_results.dta saved
+
+. 
+. 
+. * 4. Parameter regions (essay Table 8): every admissible parameter vector, with
+. *    no shock and with each of the 24 shocks, on the grid households.
+. if `quick_test' {
+.     local A_N_values   1.40 2.40
+.     local gamma_values .45 .65
+.     local rho_values   .80 1
+.     local eta_values   .75 1.75
+.     local kappa_values .15 .40
+. }
+
+. else {
+.     local A_N_values   1.40 1.80 2.40 3.00
+.     local gamma_values .45 .55 .65 .75
+.     local rho_values   .70 .80 .90 1
+.     local eta_values   .75 1.25 1.75 2.25
+.     local kappa_values .15 .25 .40 .60
+. }
+
+. 
+. tempfile parameters shocks
+
+. tempname grid
+
+. postfile `grid' long parameter_id double(A_N gamma rho eta kappa) using "`parameters'"
+
+. local id = 0
+
+. foreach A_N of local A_N_values {
+  2.     foreach gamma of local gamma_values {
+  3.         foreach rho of local rho_values {
+  4.             * The essay requires 0 < gamma < rho <= 1.
+.             if `gamma' >= `rho' continue
+  5.             foreach eta of local eta_values {
+  6.                 foreach kappa of local kappa_values {
+  7.                     local ++id
+  8.                     post `grid' (`id') (`A_N') (`gamma') (`rho') (`eta') (`kappa')
+  9.                 }
+ 10.             }
+ 11.         }
+ 12.     }
+ 13. }
+
+. postclose `grid'
+
+. 
+. * Shock intensity: tau for health shocks, 1 - lambda for the cost shock and
+. * tau_M for the two-index shock.
+. postfile `grid' byte(shock_id shock_type) double(tau lambda tau_a tau_m intensity) ///
+>     using "`shocks'"
+
+. post `grid' (0) (0) (0) (1) (0) (0) (0)
+
+. local id = 0
+
+. foreach type in 1 2 {
+  2.     foreach tau in .10 .20 .30 .40 {
+  3.         local ++id
+  4.         post `grid' (`id') (`type') (`tau') (1) (0) (0) (`tau')
+  5.     }
+  6. }
+
+. foreach lambda in 1 .90 .80 .70 .60 {
+  2.     local ++id
+  3.     post `grid' (`id') (3) (0) (`lambda') (0) (0) (1 - `lambda')
+  4. }
+
+. foreach tau_a in 0 .10 .20 {
+  2.     foreach tau_m in .10 .20 .30 .40 {
+  3.         if `tau_m' < `tau_a' continue
+  4.         local ++id
+  5.         post `grid' (`id') (4) (0) (1) (`tau_a') (`tau_m') (`tau_m')
+  6.     }
+  7. }
+
+. postclose `grid'
+
+. 
+. use "`data'/households_grid.dta", clear
+
+. ec_load_households
+
+. use "`parameters'", clear
+
+. quietly cross using "`shocks'"
+
+. generate double A_A = 1
+
+. generate double beta = 1
+
+. assert _N == cond(`quick_test', 32, 960) * 25
+
+. sort parameter_id shock_id
+
+. display as text "Parameter regions: solving " _N " runs..."
+Parameter regions: solving 24000 runs...
+
+. mata: ec_solve_runs()
+  2000 of 24000 runs solved
+  4000 of 24000 runs solved
+  6000 of 24000 runs solved
+  8000 of 24000 runs solved
+  10000 of 24000 runs solved
+  12000 of 24000 runs solved
+  14000 of 24000 runs solved
+  16000 of 24000 runs solved
+  18000 of 24000 runs solved
+  20000 of 24000 runs solved
+  22000 of 24000 runs solved
+  24000 of 24000 runs solved
+
+. ec_measures
+
+. compare_with_no_shock
+(1,155 missing values generated)
+(200 missing values generated)
+(1,355 missing values generated)
+(1,355 missing values generated)
+(1,254 missing values generated)
+
+. label_runs
+
+. label variable intensity "Shock intensity"
+
+. save "`data'/parameter_regions.dta", replace
+file E:\predoc2027\ec428-exhibition\stata/data/derived/parameter_regions.dta saved
+
+. 
+. 
+. * 5. Robustness: vary one parameter at a time, additive shock tau = .25, on the
+. *    baseline households (essay Table 6).
+. use "`data'/households_baseline.dta", clear
+
+. ec_load_households
+
+. clear
+
+. input long parameter_id str5 varied double value
+
+     parameter_id     varied       value
+  1.  1 kappa  .10
+  2.  2 kappa  .25
+  3.  3 kappa  .50
+  4.  4 kappa 1
+  5.  5 eta    .75
+  6.  6 eta   1.25
+  7.  7 eta   1.75
+  8.  8 rho    .60
+  9.  9 rho    .80
+ 10. 10 rho   1
+ 11. end
+
+. add_calibration `calibration'
+
+. foreach p in kappa eta rho {
+  2.     quietly replace `p' = value if varied == "`p'"
+  3. }
+
+. quietly expand 2
+
+. bysort parameter_id: generate byte shock_id = _n - 1
+
+. generate byte shock_type = shock_id
+
+. generate double tau = .25 * shock_id
+
+. generate double lambda = 1
+
+. generate double tau_a = 0
+
+. generate double tau_m = 0
+
+. mata: ec_solve_runs()
+
+. ec_measures
+
+. compare_with_no_shock
+
+. label_runs
+
+. label variable varied "Parameter varied"
+
+. label variable value "Value of the varied parameter"
+
+. save "`data'/robustness.dta", replace
+file E:\predoc2027\ec428-exhibition\stata/data/derived/robustness.dta saved
+
+. 
+. 
+. * 6. Settings of this run, used by the tables and figures.
+. clear
+
+. quietly set obs 1
+
+. generate byte quick_test = `quick_test'
+
+. generate byte new_households = `new_households'
+
+. generate long seed = `seed'
+
+. foreach sample in baseline grid {
+  2.     preserve
+  3.     use "`data'/households_`sample'.dta", clear
+  4.     quietly count if member_id == 1
+  5.     local `sample'_households = r(N)
+  6.     restore
+  7.     generate long `sample'_households = ``sample'_households'
+  8. }
+
+. generate str20 date = "`c(current_date)'"
+
+. save "`data'/run_settings.dta", replace
+file E:\predoc2027\ec428-exhibition\stata/data/derived/run_settings.dta saved
+
+. 
+. display as result "Done: simulation datasets saved in data/derived/."
+Done: simulation datasets saved in data/derived/.
+
+. 
+end of do-file
+
+Running analysis/Make_tables.do...
+
+. /*
+> Tables
+> 
+> Purpose: Make the simulation tables of the EC428 essay from the saved
+> simulation datasets, and compare headline results with the essay.
+> 
+> Input: the datasets in data/derived/, made by simulation/Run_simulations.do.
+> Requirements: Stata 17 or later.
+> 
+> Outputs, each as .csv and as a LaTeX tabular (.tex), in output/tables/:
+> - validation_checks: theory checks (essay Table 1)
+> - baseline: additive health shocks at the baseline calibration (essay Tables 3 and 5)
+> - region_summary: parameter regions by shock family (essay Tables 2 and 4)
+> - mean_changes: mean changes by shock family (essay Table 7)
+> - robustness: one parameter varied at a time (essay Table 6)
+> - essay_comparison: headline results next to the values reported in the essay
+> 
+> Run from the project root via run_all.do or do analysis/Make_tables.do.
+> An optional first argument supplies the project root.
+> */
+. 
+. version 17
+
+. clear all
+
+. set more off
+
+. 
+. args project_root
+
+. if `"`project_root'"' == "" local project_root "`c(pwd)'"
+
+. 
+. capture confirm file "`project_root'/run_all.do"
+
+. if _rc {
+.     display as error "Run from the project root: cd to the folder containing run_all.do."
+.     exit 601
+. }
+
+. local data "`project_root'/data/derived"
+
+. local outdir "`project_root'/output/tables"
+
+. capture mkdir "`project_root'/output"
+
+. capture mkdir "`outdir'"
+
+. 
+. foreach file in run_settings validation_checks baseline_results parameter_regions robustness {
+  2.     capture confirm file "`data'/`file'.dta"
+  3.     if _rc {
+  4.         display as error "data/derived/`file'.dta is missing. Run simulation/Run_simulations.do first, or do run_all.do."
+  5.         exit 601
+  6.     }
+  7. }
+
+. use "`data'/run_settings.dta", clear
+
+. local quick_test = quick_test[1]
+
+. 
+. capture program drop write_table
+
+. program define write_table
+  1.     * Save the listed variables as a CSV file and as a LaTeX tabular. Column
+.     * headings are the variable labels; numbers use each variable's display format.
+.     syntax varlist using/
+  2.     quietly export delimited `varlist' using "`using'.csv", replace datafmt
+  3.     tempname tex
+  4.     file open `tex' using "`using'.tex", write text replace
+  5.     local align "l"
+  6.     local columns : word count `varlist'
+  7.     forvalues i = 2/`columns' {
+  8.         local align "`align'r"
+  9.     }
+ 10.     file write `tex' "\begin{tabular}{`align'}" _n "\hline" _n
+ 11.     local line
+ 12.     foreach v of local varlist {
+ 13.         local label : variable label `v'
+ 14.         if `"`label'"' == "" local label `v'
+ 15.         local label = subinstr(`"`label'"', "_", "\_", .)
+ 16.         if `"`line'"' != "" local line `"`line' & "'
+ 17.         local line `"`line'`label'"'
+ 18.     }
+ 19.     file write `tex' `"`line' "' _char(92) _char(92) _n "\hline" _n
+ 20.     forvalues i = 1/`=_N' {
+ 21.         local line
+ 22.         foreach v of local varlist {
+ 23.             capture confirm string variable `v'
+ 24.             if !_rc {
+ 25.                 local cell = `v'[`i']
+ 26.             }
+ 27.             else if missing(`v'[`i']) {
+ 28.                 local cell "--"
+ 29.             }
+ 30.             else {
+ 31.                 local fmt : format `v'
+ 32.                 local cell : display `fmt' `v'[`i']
+ 33.             }
+ 34.             local cell = strtrim(`"`cell'"')
+ 35.             local cell = subinstr(`"`cell'"', "_", "\_", .)
+ 36.             if `"`line'"' != "" local line `"`line' & "'
+ 37.             local line `"`line'`cell'"'
+ 38.         }
+ 39.         file write `tex' `"`line' "' _char(92) _char(92) _n
+ 40.     }
+ 41.     file write `tex' "\hline" _n "\end{tabular}" _n
+ 42.     file close `tex'
+ 43. end
+
+. 
+. 
+. * 1. Theory checks (essay Table 1).
+. use "`data'/validation_checks.dta", clear
+
+. decode check_id, generate(check)
+
+. generate str3 result = cond(passed == 1, "Yes", "No")
+
+. format diagnostic %9.3f
+
+. label variable check "Check"
+
+. label variable diagnostic "Diagnostic"
+
+. label variable result "Passed"
+
+. write_table check diagnostic result using "`outdir'/validation_checks"
+
+. 
+. 
+. * 2. Baseline additive health shocks (essay Tables 3 and 5).
+. use "`data'/baseline_results.dta", clear
+
+. sort shock_id
+
+. format tau %4.2f
+
+. format migration_rate current_health_migrants current_health_stayers lp_a lp_n apg d_apg %6.3f
+
+. format ag_output nonag_output welfare %10.1f
+
+. label variable tau "tau"
+
+. label variable migration_rate "Migration rate"
+
+. label variable current_health_migrants "Mean health, migrants"
+
+. label variable current_health_stayers "Mean health, stayers"
+
+. label variable ag_output "Farm output"
+
+. label variable nonag_output "Non-farm output"
+
+. label variable welfare "Welfare"
+
+. label variable lp_a "LP_A"
+
+. label variable lp_n "LP_N"
+
+. label variable apg "APG"
+
+. label variable d_apg "Change in APG"
+
+. write_table tau migration_rate current_health_migrants current_health_stayers ///
+>     ag_output nonag_output welfare lp_a lp_n apg d_apg using "`outdir'/baseline"
+
+. 
+. * Values for the comparison with the essay: no shock, tau = .20 and tau = .40.
+. foreach s in 0 4 8 {
+  2.     summarize migration_rate if shock_id == `s', meanonly
+  3.     local migration`s' = r(mean)
+  4.     summarize apg if shock_id == `s', meanonly
+  5.     local apg`s' = r(mean)
+  6. }
+
+. 
+. 
+. * 3. Parameter regions by shock family (essay Tables 2, 4 and 7).
+. *    APG directions and the mean APG change use APG-valid runs only; all other
+. *    shares and means use every run.
+. use "`data'/parameter_regions.dta", clear
+
+. keep if shock_id > 0
+(960 observations deleted)
+
+. generate byte widening = apg_direction == 1 if apg_valid
+(1,347 missing values generated)
+
+. generate byte unchanged = apg_direction == 2 if apg_valid
+(1,347 missing values generated)
+
+. generate byte narrowing = apg_direction == 3 if apg_valid
+(1,347 missing values generated)
+
+. generate double valid_d_apg = d_apg if apg_valid
+(1,347 missing values generated)
+
+. local stats (count) runs=shock_id (mean) core=core_mechanism ag_down=ag_output_decline ///
+>     (sum) valid=apg_valid (mean) widening unchanged narrowing mean_d_apg=valid_d_apg ///
+>     mean_d_ag_output=d_ag_output mean_d_migration=d_migration_rate mean_d_welfare=d_welfare
+
+. tempfile overall
+
+. preserve
+
+. collapse `stats'
+
+. generate byte shock_type = 0
+
+. save "`overall'"
+file C:\Users\LEONAR~1\AppData\Local\Temp\ST_47cc_000001.tmp saved as .dta format
+
+. restore
+
+. collapse `stats', by(shock_type)
+
+. append using "`overall'"
+
+. label define shock_family 0 "All shocks" 1 "Additive health" 2 "Multiplicative health" ///
+>     3 "Migration cost" 4 "Two health indices", replace
+
+. label values shock_type shock_family
+
+. sort shock_type
+
+. decode shock_type, generate(family)
+
+. generate long undefined = runs - valid
+
+. 
+. foreach s in 0 1 2 3 4 {
+  2.     summarize core if shock_type == `s', meanonly
+  3.     local core`s' = r(mean)
+  4. }
+
+. foreach v in runs ag_down valid widening {
+  2.     summarize `v' if shock_type == 0, meanonly
+  3.     local all_`v' = r(mean)
+  4. }
+
+. 
+. format runs valid undefined %9.0f
+
+. format core ag_down widening unchanged narrowing mean_d_apg mean_d_migration %6.3f
+
+. format mean_d_ag_output mean_d_welfare %9.1f
+
+. label variable family "Shock family"
+
+. label variable runs "Runs"
+
+. label variable core "Core"
+
+. label variable ag_down "Farm output down"
+
+. label variable valid "APG valid"
+
+. label variable widening "Widen"
+
+. label variable unchanged "Flat"
+
+. label variable narrowing "Narrow"
+
+. label variable undefined "Undefined"
+
+. label variable mean_d_apg "Mean change in APG"
+
+. label variable mean_d_ag_output "Mean change in farm output"
+
+. label variable mean_d_migration "Mean change in migration"
+
+. label variable mean_d_welfare "Mean change in welfare"
+
+. write_table family runs core ag_down valid widening unchanged narrowing undefined ///
+>     mean_d_apg using "`outdir'/region_summary"
+
+. write_table family mean_d_apg mean_d_ag_output mean_d_migration mean_d_welfare ///
+>     using "`outdir'/mean_changes"
+
+. 
+. 
+. * 4. Robustness: one parameter varied at a time, additive tau = .25 (essay Table 6).
+. use "`data'/robustness.dta", clear
+
+. keep if shock_id == 1
+(10 observations deleted)
+
+. sort parameter_id
+
+. format value tau migration_rate d_migration_rate lp_a lp_n apg d_apg %6.3f
+
+. label variable varied "Parameter"
+
+. label variable value "Value"
+
+. label variable tau "tau"
+
+. label variable migration_rate "Migration rate"
+
+. label variable d_migration_rate "Change in migration"
+
+. label variable lp_a "LP_A"
+
+. label variable lp_n "LP_N"
+
+. label variable apg "APG"
+
+. label variable d_apg "Change in APG"
+
+. write_table varied value tau migration_rate d_migration_rate lp_a lp_n apg d_apg ///
+>     using "`outdir'/robustness"
+
+. 
+. 
+. * 5. Headline results next to the values reported in the essay (Tables 2-4).
+. *    The households are new draws, so small differences are expected.
+. tempfile comparison
+
+. tempname results
+
+. postfile `results' str40 statistic double(essay this_run) using "`comparison'"
+
+. post `results' ("Migration rate, no shock") (.508) (`migration0')
+
+. post `results' ("Migration rate, tau = .20") (.680) (`migration4')
+
+. post `results' ("Migration rate, tau = .40") (.845) (`migration8')
+
+. post `results' ("APG, no shock") (2.693) (`apg0')
+
+. post `results' ("APG, tau = .40") (1.756) (`apg8')
+
+. post `results' ("Parameter-shock runs") (23040) (`all_runs')
+
+. post `results' ("Core share, all shocks") (.951) (`core0')
+
+. post `results' ("Core share, additive health") (.993) (`core1')
+
+. post `results' ("Core share, multiplicative health") (1) (`core2')
+
+. post `results' ("Core share, migration cost") (.799) (`core3')
+
+. post `results' ("Core share, two health indices") (.992) (`core4')
+
+. post `results' ("Share with farm output down, all shocks") (.907) (`all_ag_down')
+
+. post `results' ("APG-valid runs") (21761) (`all_valid')
+
+. post `results' ("Share of APG widening, valid runs") (.173) (`all_widening')
+
+. postclose `results'
+
+. use "`comparison'", clear
+
+. generate double difference = this_run - essay
+
+. * Counts are shown as whole numbers, shares and levels with three decimals.
+. generate byte count = inlist(statistic, "Parameter-shock runs", "APG-valid runs")
+
+. foreach v in essay this_run difference {
+  2.     generate str12 `v'_text = strtrim(cond(count, string(`v', "%9.0f"), string(`v', "%9.3f")))
+  3.     drop `v'
+  4.     rename `v'_text `v'
+  5. }
+
+. label variable statistic "Statistic"
+
+. label variable essay "Essay"
+
+. label variable this_run "This run"
+
+. label variable difference "Difference"
+
+. write_table statistic essay this_run difference using "`outdir'/essay_comparison"
+
+. if `quick_test' {
+.     display as text "Quick test: the essay comparison uses a smaller grid and is not comparable."
+. }
+
+. 
+. display as result "Done: six tables saved in output/tables/."
+Done: six tables saved in output/tables/.
+
+. 
+end of do-file
+
+Running analysis/Make_figures.do...
+
+. /*
+> Figures
+> 
+> Purpose: Make the simulation figures of the EC428 essay from the saved
+> simulation datasets.
+> 
+> Input: the datasets in data/derived/, made by simulation/Run_simulations.do.
+> Requirements: Stata 17 or later.
+> 
+> Outputs, as PDF files in output/figures/ (essay figure in parentheses):
+> - migration_by_health: migration rate by health, before and after the shock (Figure 1)
+> - health_by_allocation: mean health of migrants and farm stayers (Figure 2)
+> - output_and_welfare: farm output, non-farm output and welfare (Figure 3)
+> - apg_by_shock: mean change in APG by shock family (Figure 4)
+> - productivity_response: change in output per worker in each sector (Figure 5)
+> - migration_by_shock: mean change in migration by shock family (Figure 6)
+> - selection_by_shock: health gap between migrants and farm stayers (Figure 7)
+> - apg_heatmap_costs: mean change in APG by kappa and eta (Figure 9)
+> - apg_heatmap_labor: mean change in APG by rho and gamma (Figure 10)
+> 
+> Run from the project root via run_all.do or do analysis/Make_figures.do.
+> An optional first argument supplies the project root.
+> */
+. 
+. version 17
+
+. clear all
+
+. set more off
+
+. 
+. args project_root
+
+. if `"`project_root'"' == "" local project_root "`c(pwd)'"
+
+. 
+. capture confirm file "`project_root'/run_all.do"
+
+. if _rc {
+.     display as error "Run from the project root: cd to the folder containing run_all.do."
+.     exit 601
+. }
+
+. local data "`project_root'/data/derived"
+
+. local outdir "`project_root'/output/figures"
+
+. capture mkdir "`project_root'/output"
+
+. capture mkdir "`outdir'"
+
+. 
+. foreach file in run_settings baseline_results baseline_choices parameter_regions {
+  2.     capture confirm file "`data'/`file'.dta"
+  3.     if _rc {
+  4.         display as error "data/derived/`file'.dta is missing. Run simulation/Run_simulations.do first, or do run_all.do."
+  5.         exit 601
+  6.     }
+  7. }
+
+. use "`data'/run_settings.dta", clear
+
+. local baseline_households : display %9.0fc baseline_households[1]
+
+. local baseline_households = strtrim("`baseline_households'")
+
+. set scheme s1color
+
+. 
+. capture program drop apg_heatmap
+
+. program define apg_heatmap
+  1.     * Heat map of the mean change in APG by two parameters. Each cell averages
+.     * over the APG-valid runs in memory: all other parameters and all shocks.
+.     syntax varlist(min=2 max=2), Title(string) XTitle(string) YTitle(string) ///
+>         Note(string) File(string)
+  2.     tokenize `varlist'
+  3.     local xvar `1'
+  4.     local yvar `2'
+  5.     collapse (mean) d_apg, by(`xvar' `yvar')
+  6.     egen int column = group(`xvar')
+  7.     egen int row = group(`yvar')
+  8. 
+.     * Axis labels show the parameter values.
+.     foreach axis in column row {
+  9.         local var = cond("`axis'" == "column", "`xvar'", "`yvar'")
+ 10.         local labels_`axis'
+ 11.         quietly levelsof `axis', local(levels)
+ 12.         foreach l of local levels {
+ 13.             quietly summarize `var' if `axis' == `l', meanonly
+ 14.             local text = string(r(mean), "%4.2f")
+ 15.             local labels_`axis' `"`labels_`axis'' `l' "`text'""'
+ 16.         }
+ 17.     }
+ 18. 
+.     * Nine color classes centered at zero: blue = APG narrows, red = APG widens.
+.     quietly summarize d_apg, meanonly
+ 19.     local scale = max(abs(r(min)), abs(r(max)), 1e-6)
+ 20.     generate byte shade = min(9, 1 + floor(9 * (d_apg + `scale') / (2 * `scale')))
+ 21.     generate double lower = row - .5
+ 22.     generate double upper = row + .5
+ 23.     generate str8 cell = string(d_apg, "%5.2f")
+ 24.     local colors navy navy*.7 navy*.45 navy*.25 gs15 cranberry*.25 cranberry*.45 cranberry*.7 cranberry
+ 25.     local plots
+ 26.     forvalues s = 1/9 {
+ 27.         quietly count if shade == `s'
+ 28.         if r(N) > 0 {
+ 29.             local color : word `s' of `colors'
+ 30.             local plots `plots' (rbar lower upper column if shade == `s', ///
+>                 barwidth(1) fcolor(`color') fintensity(100) lcolor(white) lwidth(medthick))
+ 31.         }
+ 32.     }
+ 33.     * Labels: white on dark cells, black on light ones.
+.     quietly count if inlist(shade, 1, 2, 8, 9)
+ 34.     if r(N) > 0 {
+ 35.         local plots `plots' (scatter row column if inlist(shade, 1, 2, 8, 9), ///
+>             msymbol(none) mlabel(cell) mlabposition(0) mlabcolor(white))
+ 36.     }
+ 37.     quietly count if inrange(shade, 3, 7)
+ 38.     if r(N) > 0 {
+ 39.         local plots `plots' (scatter row column if inrange(shade, 3, 7), ///
+>             msymbol(none) mlabel(cell) mlabposition(0) mlabcolor(black))
+ 40.     }
+ 41.     quietly summarize column, meanonly
+ 42.     local xmax = r(max) + .5
+ 43.     quietly summarize row, meanonly
+ 44.     local ymax = r(max) + .5
+ 45.     twoway `plots', ///
+>         title("`title'") xtitle("`xtitle'") ytitle("`ytitle'") ///
+>         xlabel(`labels_column', noticks nogrid) ylabel(`labels_row', noticks nogrid angle(0)) ///
+>         xscale(range(.5 `xmax')) yscale(range(.5 `ymax')) legend(off) ///
+>         note("Mean change in APG over APG-valid runs. Blue: APG narrows; red: APG widens." ///
+>             "`note'")
+ 46.     graph export "`file'", replace
+ 47. end
+
+. 
+. 
+. * 1. Migration rate by health, before and after the shock (essay Figure 1).
+. use "`data'/baseline_choices.dta", clear
+
+. generate byte bin = min(floor(health * 10), 9)
+
+. collapse (mean) mean_health=health before=migrate_before after=migrate_after, by(bin)
+
+. sort mean_health
+
+. twoway (connected before mean_health, lcolor(navy) mcolor(navy) msymbol(O)) ///
+>     (connected after mean_health, lcolor(maroon) mcolor(maroon) msymbol(D)), ///
+>     title("Migration rate by health") ///
+>     xtitle("Mean health within bin, before the shock") ytitle("Migration rate") ///
+>     xlabel(.2(.2)1, format(%3.1f)) ///
+>     ylabel(0 "0%" .25 "25%" .5 "50%" .75 "75%" 1 "100%", angle(0)) ///
+>     legend(order(1 "No shock" 2 "Additive shock, {&tau} = 0.40") rows(1) position(6)) ///
+>     note("Health bins of width 0.1. Baseline calibration, `baseline_households' households.")
+
+. graph export "`outdir'/migration_by_health.pdf", replace
+file E:\predoc2027\ec428-exhibition\stata/output/figures/migration_by_health.pdf saved as PDF format
+
+. 
+. 
+. * 2. Mean health of migrants and farm stayers (essay Figure 2).
+. use "`data'/baseline_results.dta", clear
+
+. keep if inlist(shock_id, 0, 8)
+(7 observations deleted)
+
+. generate byte after = shock_id == 8
+
+. keep after current_health_migrants current_health_stayers
+
+. rename (current_health_migrants current_health_stayers) (health1 health2)
+
+. quietly reshape long health, i(after) j(group)
+
+. label define group 1 "Migrants" 2 "Farm stayers"
+
+. label values group group
+
+. graph bar (asis) health, over(after) over(group) asyvars ///
+>     bar(1, color(navy)) bar(2, color(maroon)) ///
+>     title("Health of migrants and farm stayers") ///
+>     ytitle("Mean health") ylabel(0(.2)1, angle(0) format(%3.1f)) ///
+>     legend(order(1 "No shock" 2 "Additive shock, {&tau} = 0.40") rows(1) position(6)) ///
+>     note("Health after the shock. Households choose again who migrates after the shock.")
+
+. graph export "`outdir'/health_by_allocation.pdf", replace
+file E:\predoc2027\ec428-exhibition\stata/output/figures/health_by_allocation.pdf saved as PDF format
+
+. 
+. 
+. * 3. Sectoral output and household welfare (essay Figure 3).
+. use "`data'/baseline_results.dta", clear
+
+. sort shock_id
+
+. foreach v in ag_output nonag_output welfare {
+  2.     generate double index_`v' = `v' / `v'[1]
+  3. }
+
+. twoway (connected index_ag_output tau, lcolor(navy) mcolor(navy) msymbol(O)) ///
+>     (connected index_nonag_output tau, lcolor(maroon) mcolor(maroon) msymbol(D)) ///
+>     (connected index_welfare tau, lcolor(forest_green) mcolor(forest_green) msymbol(S)), ///
+>     yline(1, lpattern(dash) lcolor(gs10)) ///
+>     title("Sectoral output and household welfare") ///
+>     xtitle("Additive health shock, {&tau}") ytitle("Index, no shock = 1") ///
+>     xlabel(0(.1).4, format(%3.1f)) ylabel(, angle(0) format(%3.1f)) ///
+>     legend(order(1 "Farm output" 2 "Non-farm output" 3 "Household welfare") ///
+>         rows(1) position(6) size(small)) ///
+>     note("Sectoral output is gross output; welfare also subtracts migration costs.")
+
+. graph export "`outdir'/output_and_welfare.pdf", replace
+file E:\predoc2027\ec428-exhibition\stata/output/figures/output_and_welfare.pdf saved as PDF format
+
+. 
+. 
+. * 4. Output per worker in each sector (essay Figure 5, headline case).
+. twoway (connected d_lp_a tau, lcolor(navy) mcolor(navy) msymbol(O)) ///
+>     (connected d_lp_n tau, lcolor(maroon) mcolor(maroon) msymbol(D)), ///
+>     yline(0, lpattern(dash) lcolor(gs10)) ///
+>     title("Output per worker") ///
+>     xtitle("Additive health shock, {&tau}") ytitle("Change from no shock") ///
+>     xlabel(0(.1).4, format(%3.1f)) ylabel(, angle(0) format(%3.1f)) ///
+>     legend(order(1 "Farm, LP{sub:A}" 2 "Non-farm, LP{sub:N}") rows(1) position(6)) ///
+>     note("Farm output per worker can rise while total farm output falls.")
+
+. graph export "`outdir'/productivity_response.pdf", replace
+file E:\predoc2027\ec428-exhibition\stata/output/figures/productivity_response.pdf saved as PDF format
+
+. 
+. 
+. * 5-7. Responses by shock family (essay Figures 4, 6 and 7).
+. foreach outcome in apg migration selection {
+  2.     use "`data'/parameter_regions.dta", clear
+  3.     keep if shock_id > 0
+  4.     if "`outcome'" == "apg" {
+  5.         keep if apg_valid
+  6.         generate double y = d_apg
+  7.         local title "Change in the productivity gap"
+  8.         local ytitle "Mean change in APG"
+  9.         local note "Means over runs with both sectors active before and after the shock."
+ 10.         local file apg_by_shock
+ 11.         local yformat %3.1f
+ 12.     }
+ 13.     else if "`outcome'" == "migration" {
+ 14.         generate double y = d_migration_rate
+ 15.         local title "Change in migration"
+ 16.         local ytitle "Mean change in migration rate"
+ 17.         local note "Means over all runs."
+ 18.         local file migration_by_shock
+ 19.         local yformat %3.1f
+ 20.     }
+ 21.     else {
+ 22.         generate double y = initial_health_migrants - initial_health_stayers
+ 23.         local title "Health selection of migrants"
+ 24.         local ytitle "Mean health, migrants minus stayers"
+ 25.         local note "Health before the shock. Runs with no migrants or no stayers are left out."
+ 26.         local file selection_by_shock
+ 27.         local yformat %5.3f
+ 28.     }
+ 29.     collapse (mean) y, by(shock_type intensity)
+ 30.     sort shock_type intensity
+ 31.     twoway (connected y intensity if shock_type == 1, lcolor(navy) mcolor(navy) msymbol(O)) ///
+>         (connected y intensity if shock_type == 2, lcolor(maroon) mcolor(maroon) msymbol(D)) ///
+>         (connected y intensity if shock_type == 3, lcolor(forest_green) mcolor(forest_green) msymbol(S)) ///
+>         (connected y intensity if shock_type == 4, lcolor(dkorange) mcolor(dkorange) msymbol(T)), ///
+>         yline(0, lpattern(dash) lcolor(gs10)) ///
+>         title("`title'") xtitle("Shock intensity") ytitle("`ytitle'") ///
+>         xlabel(0(.1).4, format(%3.1f)) ylabel(, angle(0) format(`yformat')) ///
+>         legend(order(1 "Additive health" 2 "Multiplicative health" 3 "Migration cost" ///
+>             4 "Two health indices") rows(2) position(6)) ///
+>         note("Intensity: {&tau} for health shocks, 1 - {&lambda} for the cost shock, {&tau}{sub:M} for two indices." ///
+>             "`note'")
+ 32.     graph export "`outdir'/`file'.pdf", replace
+ 33. }
+(960 observations deleted)
+(1,347 observations deleted)
+file E:\predoc2027\ec428-exhibition\stata/output/figures/apg_by_shock.pdf saved as PDF format
+(960 observations deleted)
+file E:\predoc2027\ec428-exhibition\stata/output/figures/migration_by_shock.pdf saved as PDF format
+(960 observations deleted)
+(1,246 missing values generated)
+file E:\predoc2027\ec428-exhibition\stata/output/figures/selection_by_shock.pdf saved as PDF format
+
+. 
+. 
+. * 8-9. Where does the productivity gap widen? (essay Figures 9 and 10)
+. use "`data'/parameter_regions.dta", clear
+
+. keep if shock_id > 0 & apg_valid
+(2,307 observations deleted)
+
+. apg_heatmap kappa eta, title("Change in APG by migration-cost parameters") ///
+>     xtitle("Migration-cost level, {&kappa}") ytitle("Health elasticity of the cost, {&eta}") ///
+>     note("Each cell averages over the other parameters and all shocks.") ///
+>     file("`outdir'/apg_heatmap_costs.pdf")
+file E:\predoc2027\ec428-exhibition\stata/output/figures/apg_heatmap_costs.pdf saved as PDF format
+
+. 
+. use "`data'/parameter_regions.dta", clear
+
+. keep if shock_id > 0 & apg_valid
+(2,307 observations deleted)
+
+. apg_heatmap rho gamma, title("Change in APG by farm-labor parameters") ///
+>     xtitle("Substitutability of farm labor, {&rho}") ytitle("Output elasticity of farm labor, {&gamma}") ///
+>     note("Each cell averages over the other parameters and all shocks. Blank cells: {&gamma} must be below {&rho}.") ///
+>     file("`outdir'/apg_heatmap_labor.pdf")
+file E:\predoc2027\ec428-exhibition\stata/output/figures/apg_heatmap_labor.pdf saved as PDF format
+
+. 
+. display as result "Done: nine figures saved in output/figures/."
+Done: nine figures saved in output/figures/.
+
+. 
+end of do-file
+
+. 
+. local minutes = (clock("`c(current_date)' `c(current_time)'", "DMYhms") - `start') / 60000
+
+. display as result _n "Done in " %4.1f `minutes' " minutes."
+
+Done in  1.4 minutes.
+
+. display as result "Datasets: data/derived/. Tables, figures and log: output/."
+Datasets: data/derived/. Tables, figures and log: output/.
+
+. log close pipeline
+      name:  pipeline
+       log:  E:\predoc2027\ec428-exhibition\stata/output/logs/run_all.log
+  log type:  text
+ closed on:  17 Oct 2026, 00:26:08
+---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
